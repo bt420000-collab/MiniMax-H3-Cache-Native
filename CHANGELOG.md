@@ -10,4 +10,4 @@
 - Added normalized cumulative error budget.
 - Added ComfyUI cache-conflict detection.
 - Added optional dynamic-vbar prefetch disable A/B switch.
-- Added unit/static validation and an updated I2V example workflow.
+- Added unit/static validation and an alpha wiring example for native H3 workflows.
