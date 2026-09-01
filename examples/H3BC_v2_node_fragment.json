@@ -1,0 +1,27 @@
+{
+  "type": "ApplyMiniMaxH3BC",
+  "title": "MiniMax H3BC v2 Adaptive Cache (Alpha)",
+  "category": "MiniMax H3/optimization",
+  "connection": "Load Diffusion Model -> H3BC -> Basic Scheduler / Basic Guider",
+  "widgets_values": [
+    "H3BC Balanced α — 0.07",
+    0.07,
+    0.10,
+    0.95,
+    2,
+    1,
+    true,
+    0.58,
+    1.25,
+    0.80,
+    true,
+    "inherit",
+    true
+  ],
+  "notes": [
+    "Keep the stock MiniMax H3 sampler and 20-step scheduler unchanged.",
+    "Connect the patched MODEL to both Basic Scheduler and Basic Guider.",
+    "Do not stack another double_block cache or replacement node.",
+    "Alpha presets are not yet quality calibrated."
+  ]
+}
