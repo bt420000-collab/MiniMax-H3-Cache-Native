@@ -1,133 +1,311 @@
-# H3BC — MiniMax H3 Block Cache Native
+# H3BC - MiniMax H3 Cache Native
 
-**Version:** 2.0.0-alpha1  
-**Status:** engineering alpha, not yet quality-calibrated
+**Version:** 2.0.0-alpha2  
+**Status:** engineering alpha, production-safety/profiling phase
 
-H3BC is a training-free inference cache for **native MiniMax H3** in ComfyUI. It keeps the original H3 model, sampler, scheduler and step count intact. It does **not** use a Turbo/PDD/Distillation LoRA and does not monkey-patch `MiniMaxH3Model._forward`.
+H3BC is a lightweight, training-free runtime cache for **native MiniMax H3** in ComfyUI. It preserves the original H3 model, scheduler, sampler contract and denoising step count. It is not FastH3, PDD, Turbo LoRA, or a distilled low-step model.
 
-The intended production target is **Stock H3 20-step with less repeated DiT work**.
+The current target is:
 
-## What changed from H3BC v0.1
+> **Stock MiniMax H3 20-step + conservative residual cache + frequent exact refresh.**
 
-v0.1 used a lightweight input signature and cached the whole DiT-stack residual. v2 replaces the decision path with a real neural probe:
+H3BC is intentionally independent from H3VM, Compute PM, PDD, FastH3, and production workflow plugins.
 
-1. Run the first `probe_blocks` H3 transformer blocks normally.
-2. Measure how the current probe residual changed relative to the last real step.
-3. Evaluate **video**, **audio**, and optional **max-frame temporal** change separately.
-4. Tighten the threshold near both ends of the cache window and relax it near the middle.
-5. Track a normalized cumulative **error budget** in addition to the hard consecutive-hit limit.
-6. On a cache hit, reuse the residual of the remaining transformer stack.
+## alpha2 priorities
 
-Default alpha presets currently use one real probe block and cache blocks 1–49 when the guards allow it.
+alpha2 moves H3BC from an experimental cache node toward a measurable cache engine:
 
-## Why H3-specific AV guards
+- explicit **OFF** mode with no hooks at all;
+- **LOSSLESS / REFERENCE** mode: exact H3 compute plus block profiler;
+- production-oriented **SAFE / BALANCED / AGGRESSIVE** policies;
+- first-class **Exact Refresh Policy**;
+- `warmup_steps`;
+- `max_cached_run` (the existing `max_consecutive_hits` widget is retained as the compatible UI name);
+- `force_refresh_every`;
+- explicit `force_refresh_steps`;
+- adaptive next-step refresh;
+- external `force_refresh` / `reset_cache` control contract;
+- task-boundary cache reset;
+- block residual profiling with bounded sampled state;
+- cache decision overhead and estimated net saving telemetry;
+- `H3BC_DEBUG=1` JSON telemetry export.
 
-MiniMax H3 is a packed audio-video DiT. A single global mean can hide a local motion change or an audio change. H3BC v2 therefore computes separate relative-L1 checks for the packed **video** and **audio** target ranges. With `temporal_guard=true`, the most-changed latent video frame also participates in the gate.
+## Current data path
 
-A cache hit requires every enabled guard to remain within its effective threshold.
+```text
+Native H3 MODEL
+      |
+      v
+H3BC MODEL wrapper
+      |
+      +-- OFF
+      |     +-- return original MODEL unchanged
+      |
+      +-- LOSSLESS / REFERENCE
+      |     +-- every block EXACT
+      |          +-- sampled residual profiler
+      |
+      +-- SAFE / BALANCED / AGGRESSIVE
+            |
+            v
+       Block 0..probe N EXACT
+            |
+            +-- warmup / forced refresh? -----> EXACT tail
+            +-- AV / temporal guard fail? ----> EXACT tail
+            +-- error budget exceeded? -------> EXACT tail
+            +-- max_cached_run reached? ------> EXACT tail
+            +-- confidence high --------------> reuse cached tail residual
+```
 
-## Dynamic threshold
+The tail cache is still whole-tail residual reuse after the real probe prefix. Per-block selective cache comes later, after profiling tells us which H3 blocks are actually worth caching.
 
-When enabled, the threshold multiplier follows a smooth middle-heavy curve across the active cache window:
+## Modes
 
-- window edges: `threshold × edge_ratio`
-- middle: `threshold × 1.0`
+### OFF
 
-This keeps early/late denoising more conservative without giving up the redundant middle region.
+Returns the incoming MODEL object directly. No clone, wrapper, block replacement, cache state, or telemetry is installed.
 
-## Error budget
+Use this as the true latency baseline.
 
-A cache hit consumes:
+### LOSSLESS / REFERENCE
 
-`max(video_ratio, audio_ratio, temporal_ratio)`
+Runs every H3 block exactly and records sampled step-to-step block residual behavior. It does not skip any block.
 
-where each ratio is `observed_diff / effective_threshold`.
+This mode is intended for profiling and quality reference. Profiling adds overhead, so do **not** use its wall-clock time as the native speed baseline. Use OFF for latency comparison.
 
-The cache is forced back to a full H3 step if the accumulated budget would exceed `error_budget_units`, even if the current individual hit is still under threshold. A real step resets the budget.
+### SAFE
 
-This is deliberately stricter than a simple `max_consecutive_hits` counter.
+Current starting profile:
 
-## Presets (alpha, not calibrated)
+```text
+warmup_steps = 4
+threshold = 0.030
+max_cached_run = 1
+probe_blocks = 1
+adaptive_refresh = true
+```
 
-| Preset | Base threshold | Intent |
-|---|---:|---|
-| H3BC Safe α | 0.05 | first fidelity baseline |
-| H3BC Balanced α | 0.07 | default engineering test |
-| H3BC Fast α | 0.09 | exploratory speed test |
+### BALANCED
 
-These values are **not claimed as production quality settings yet**. Fixed-seed A/B testing against uncached Stock H3 20-step is required.
+Current production-baseline candidate:
+
+```text
+warmup_steps = 4
+threshold = 0.040
+max_cached_run = 1
+probe_blocks = 1
+adaptive_refresh = true
+```
+
+This intentionally follows the conservative production pattern: one cache opportunity, then exact re-anchor.
+
+### AGGRESSIVE
+
+Experimental only:
+
+```text
+warmup_steps = 3
+threshold = 0.070
+max_cached_run = 2
+probe_blocks = 1
+adaptive_refresh = true
+```
+
+Quality loss is possible and expected to be workload dependent.
+
+The old alpha1 preset strings remain accepted so existing saved workflows do not immediately break.
+
+## Exact Refresh Policy
+
+Cache admission is no longer controlled by threshold alone.
+
+For every denoising call:
+
+```text
+Step N
+  |
+  +-- warmup? -------------------------- EXACT
+  +-- external force refresh? ---------- EXACT
+  +-- explicit force_refresh_steps? ---- EXACT
+  +-- force_refresh_every interval? ---- EXACT
+  +-- adaptive next refresh? ----------- EXACT
+  +-- cached_run >= max_cached_run? ---- EXACT
+  +-- guard/error budget fail? --------- EXACT
+  +-- otherwise ------------------------ CACHE
+```
+
+Any exact step refreshes the probe anchor and tail residual.
+
+## H3-specific cache gate
+
+H3BC uses a real prefix neural probe. After the probe prefix it compares the current probe residual with the last exact probe residual.
+
+The gate treats packed H3 modalities separately:
+
+- video relative-L1;
+- audio relative-L1;
+- optional max-frame temporal video relative-L1.
+
+A cache hit requires every enabled guard to stay inside its effective threshold.
+
+The threshold can be tightened near the start/end of the active denoising window and relaxed in the middle.
+
+## Reference Block Profiler
+
+The profiler answers the next engineering question: **which H3 blocks are both expensive and step-to-step redundant?**
+
+For each exact block it measures a deterministic sampled block residual:
+
+```text
+residual = block_output - block_input
+```
+
+and records, when available:
+
+- step index;
+- block index;
+- full sampled residual diff;
+- video sampled residual diff;
+- audio sampled residual diff;
+- residual norm;
+- block compute timing.
+
+To keep VRAM bounded, it stores only small deterministic residual samples per block, not all 50 full block residual tensors.
+
+At task end REFERENCE mode logs the most stable blocks and most expensive blocks.
+
+## Telemetry
+
+Normal runs log step-level cache decisions and a task summary.
+
+Set:
+
+```text
+H3BC_DEBUG=1
+```
+
+before starting ComfyUI to enable detailed JSON telemetry. Files are written under:
+
+```text
+ComfyUI/output/h3bc/
+```
+
+A summary includes:
+
+```text
+steps
+blocks
+exact_calls
+cache_hits
+hit_rate
+cached_steps
+forced_refresh
+decision_gate_ms
+cache_apply_cpu_ms
+gross_compute_saved_ms_est
+net_saved_ms_est
+speedup_est
+reason counts
+per-block profile
+```
+
+The estimated saved time is only produced when block timing data exists. H3BC deliberately does not pretend that skipped-block count equals real wall-clock speedup.
+
+## External refresh/reset contract
+
+H3BC reserves this standard transformer option:
+
+```python
+transformer_options["h3bc_control"] = {
+    "force_refresh": False,
+    "force_refresh_step": 8,       # or force_refresh_steps=[8, 12]
+    "reset_cache": "shot-42",     # use a changing token/nonce
+    "cache_policy": "balanced",   # reserved for future external policy control
+}
+```
+
+`reset_cache` is treated as a token so a persistent control dictionary does not accidentally reset every denoising step.
+
+The OUTER_SAMPLE wrapper also resets cache state before and after every generation task, so cache state does not leak across shots by default.
+
+## Memory behavior
+
+H3BC does not cache every block output.
+
+The acceleration path currently keeps only the last exact probe residual plus last exact tail residual, with temporary probe state during an exact step. The block profiler keeps small sampled residuals instead of full-size per-block tensors.
+
+Future work will evaluate selected-block cache, cache dtype compression, and pinned-CPU spill only after real profiling shows that they are useful.
 
 ## Connection
 
 ```text
 Load Diffusion Model
-        │
-        ▼
-MiniMax H3BC v2 Adaptive Cache (Alpha)
-        │
-        ├──► Basic Scheduler
-        └──► Basic Guider
+        |
+        v
+MiniMax H3BC Native Cache Engine (alpha2)
+        |
+        +---> Basic Scheduler
+        +---> Basic Guider
 ```
 
-Connect the patched MODEL everywhere the unpatched H3 MODEL was previously used.
+Do not stack H3BC with another H3 `double_block` cache/replacement node.
 
-Do not stack H3BC with FirstBlockCache, CacheDiT, EasyCache/LazyCache, T8 Block Cache, or another `double_block` replacement.
+## Compatibility / failure isolation
 
-## Prefetch mode
+H3BC uses ComfyUI model-patch mechanisms:
 
-Current ComfyUI MiniMax H3 creates its block prefetch queue before the block loop. A skipped block can therefore avoid compute while still participating in dynamic weight prefetch.
+- `set_model_patch_replace(..., "dit", "double_block", index)`;
+- `WrappersMP.DIFFUSION_MODEL`;
+- `WrappersMP.OUTER_SAMPLE`.
 
-`prefetch_mode=inherit` keeps ComfyUI behavior unchanged and is the default.
+It does not replace `MiniMaxH3Model._forward` and does not modify H3VM or any production plugin.
 
-`prefetch_mode=disable_dynamic_vbars` sets `prefetch_dynamic_vbars=False` on the patched model. This can help low-VRAM/cache-heavy runs, but can also make full steps slower. Treat it as an A/B switch, not a universally faster setting.
+Deleting the H3BC custom-node directory restores the original system path.
 
-## First validation matrix
+## Validation order
 
-Use the same model, prompt, seed, duration, resolution, sampler and 20-step scheduler for every run:
+First production validation should use identical model/prompt/seed/resolution/frames/sampler/scheduler:
 
-1. Stock H3 20-step, no cache.
-2. H3BC Safe α, prefetch inherit.
-3. H3BC Balanced α, prefetch inherit.
-4. H3BC Fast α, prefetch inherit.
-5. Best quality candidate again with `disable_dynamic_vbars`.
+1. OFF, true native runtime baseline.
+2. LOSSLESS / REFERENCE, exact output + block profile.
+3. SAFE.
+4. BALANCED.
+5. AGGRESSIVE only after SAFE/BALANCED are visually inspected.
 
-Record:
+Evaluate not just speed but:
 
-- total wall-clock time
-- H3BC cached/full steps
-- cache step indices
-- per-step video/audio/temporal diffs
-- final video visual difference
-- motion/face/hand/detail stability
-- speech/audio timing and timbre
+- face identity/drift;
+- hands;
+- fast motion;
+- camera motion;
+- fine texture;
+- small text/logo;
+- temporal wobble;
+- ghosting;
+- color drift;
+- lip/expression timing;
+- audio/video temporal coupling.
 
 ## Current limitations
 
-- This is an approximation. Cached and uncached runs follow different numerical trajectories.
-- Alpha presets have only static/unit validation here; no GPU H3 quality benchmark is claimed.
-- Current v2 alpha reuses the full tail residual after the probe prefix. A future v2.1 may test a real tail-refinement segment, but that is intentionally not mixed into this first validation build.
-- Dynamic ComfyUI weight prefetch cannot be perfectly skipped per cache decision without a deeper block-loop integration; this build avoids core monkey-patching.
+- H3BC is still an approximation when cache hits occur.
+- alpha2 production presets are starting points, not universal safety guarantees.
+- Per-block selective cache is **not enabled yet**. First we profile real H3 block redundancy/cost.
+- Attention-vs-MLP sub-residual profiling is not implemented yet; alpha2 profiles full H3 block residuals first.
+- Dynamic ComfyUI weight prefetch cannot be perfectly avoided for a cache hit without deeper core integration; `disable_dynamic_vbars` remains an A/B switch.
+- `decision_gate_ms` includes the synchronization needed to make the runtime cache decision, because that cost is real and must not be hidden.
 
-## Compatibility design
+## Research references
 
-H3BC uses ComfyUI's public model patch mechanisms:
+The design space is informed by:
 
-- `set_model_patch_replace(..., "dit", "double_block", index)`
-- `WrappersMP.DIFFUSION_MODEL`
-- `WrappersMP.OUTER_SAMPLE`
+- native ComfyUI MiniMax H3 block replacement hooks;
+- FirstBlockCache-style real prefix probing;
+- Cache-DiT / DBCache exact-refresh strategy;
+- vLLM-Omni MiniMax H3 conservative Cache-DiT serving work;
+- the original MiniMax H3 residual cache implementations.
 
-It does not replace MiniMax H3 forward code.
-
-## Research / implementation references
-
-The design space was informed by:
-
-- the original `lihaoyun6/ComfyUI-MiniMaxH3-Cache`
-- `duckyshell/ComfyUI-MiniMaxH3-FirstBlockCache`
-- Hugging Face Diffusers FirstBlockCache
-- ComfyUI native MiniMax H3 block replacement hooks
-
-H3BC v2 code in this package is an independent implementation.
+H3BC remains a lightweight H3-specific independent implementation and does not depend on vLLM-Omni or Cache-DiT at runtime.
 
 ## License
 
