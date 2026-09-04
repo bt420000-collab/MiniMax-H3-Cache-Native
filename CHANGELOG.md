@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.0-alpha4
+
+- Fixed critical in-place tensor aliasing in native MiniMax H3 probe snapshots and REFERENCE/debug profiler inputs.
+- Freezes probe input and post-probe state before later H3 blocks mutate the live hidden tensor.
+- Adds fail-closed zero/non-finite tail residual validation.
+- Adds an in-place mutation regression test matching MiniMax H3 block semantics.
+- Applies the first real-H3 20-step residual calibration: SAFE 0.09, BALANCED 0.10, AGGRESSIVE 0.12.
+- Preserves frequent exact refresh for SAFE/BALANCED with warmup=4 and max_cached_run=1.
+- Documents that H3BC relative-L1 thresholds are workload-specific and not numerically interchangeable with Cache-DiT thresholds.
+
 ## 2.0.0-alpha2
 
 - Added explicit `OFF` mode that returns the incoming MODEL unchanged and installs no H3BC hooks.
