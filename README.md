@@ -1,6 +1,6 @@
-# H3BC - MiniMax H3 Cache Native
+# H3BC — MiniMax H3 Cache Native
 
-**Version:** 2.0.0-alpha2  
+**Version:** 2.0.0-alpha4  
 **Status:** engineering alpha, production-safety/profiling phase
 
 H3BC is a lightweight, training-free runtime cache for **native MiniMax H3** in ComfyUI. It preserves the original H3 model, scheduler, sampler contract and denoising step count. It is not FastH3, PDD, Turbo LoRA, or a distilled low-step model.
@@ -11,9 +11,23 @@ The current target is:
 
 H3BC is intentionally independent from H3VM, Compute PM, PDD, FastH3, and production workflow plugins.
 
-## alpha2 priorities
+## alpha4 correctness + first real-H3 calibration
 
-alpha2 moves H3BC from an experimental cache node toward a measurable cache engine:
+alpha4 repairs a critical MiniMax H3 in-place tensor aliasing issue found by real 20-step testing. Alpha2 used `detach()` without cloning at probe/profiler snapshot boundaries, so H3's in-place DiT updates could collapse measured residuals and cached tail residuals to zero. Alpha4 freezes those snapshot boundaries before in-place execution and fails closed if a captured tail residual is zero/non-finite.
+
+The same real run also showed H3BC's first-block residual metric follows a clear U-shaped denoise curve, with the most stable region in the middle steps. H3BC's relative-L1 metric is not numerically interchangeable with vLLM Cache-DiT's threshold scale.
+
+First empirical alpha4 presets:
+
+```text
+SAFE       threshold 0.09, warmup 4, max_cached_run 1
+BALANCED   threshold 0.10, warmup 4, max_cached_run 1
+AGGRESSIVE threshold 0.12, warmup 3, max_cached_run 2
+```
+
+These values are calibration starting points, not universal quality guarantees. Different quantization, resolution, prompt, conditioning and hardware can shift the residual distribution.
+
+The production-safety engine still provides:
 
 - explicit **OFF** mode with no hooks at all;
 - **LOSSLESS / REFERENCE** mode: exact H3 compute plus block profiler;
@@ -34,27 +48,31 @@ alpha2 moves H3BC from an experimental cache node toward a measurable cache engi
 
 ```text
 Native H3 MODEL
-      |
-      v
+      │
+      ▼
 H3BC MODEL wrapper
-      |
-      +-- OFF
-      |     +-- return original MODEL unchanged
-      |
-      +-- LOSSLESS / REFERENCE
-      |     +-- every block EXACT
-      |          +-- sampled residual profiler
-      |
-      +-- SAFE / BALANCED / AGGRESSIVE
-            |
-            v
+      │
+      ├── OFF
+      │     └── return original MODEL unchanged
+      │
+      ├── LOSSLESS / REFERENCE
+      │     └── every block EXACT
+      │          └── sampled residual profiler
+      │
+      └── SAFE / BALANCED / AGGRESSIVE
+            │
+            ▼
        Block 0..probe N EXACT
-            |
-            +-- warmup / forced refresh? -----> EXACT tail
-            +-- AV / temporal guard fail? ----> EXACT tail
-            +-- error budget exceeded? -------> EXACT tail
-            +-- max_cached_run reached? ------> EXACT tail
-            +-- confidence high --------------> reuse cached tail residual
+            │
+            ├── warmup / forced refresh? ─────► EXACT tail
+            │
+            ├── AV / temporal guard fail? ───► EXACT tail
+            │
+            ├── error budget exceeded? ──────► EXACT tail
+            │
+            ├── max_cached_run reached? ─────► EXACT tail
+            │
+            └── confidence high ─────────────► reuse cached tail residual
 ```
 
 The tail cache is still whole-tail residual reuse after the real probe prefix. Per-block selective cache comes later, after profiling tells us which H3 blocks are actually worth caching.
@@ -79,7 +97,7 @@ Current starting profile:
 
 ```text
 warmup_steps = 4
-threshold = 0.030
+threshold = 0.090
 max_cached_run = 1
 probe_blocks = 1
 adaptive_refresh = true
@@ -91,7 +109,7 @@ Current production-baseline candidate:
 
 ```text
 warmup_steps = 4
-threshold = 0.040
+threshold = 0.100
 max_cached_run = 1
 probe_blocks = 1
 adaptive_refresh = true
@@ -105,7 +123,7 @@ Experimental only:
 
 ```text
 warmup_steps = 3
-threshold = 0.070
+threshold = 0.120
 max_cached_run = 2
 probe_blocks = 1
 adaptive_refresh = true
@@ -123,15 +141,15 @@ For every denoising call:
 
 ```text
 Step N
-  |
-  +-- warmup? -------------------------- EXACT
-  +-- external force refresh? ---------- EXACT
-  +-- explicit force_refresh_steps? ---- EXACT
-  +-- force_refresh_every interval? ---- EXACT
-  +-- adaptive next refresh? ----------- EXACT
-  +-- cached_run >= max_cached_run? ---- EXACT
-  +-- guard/error budget fail? --------- EXACT
-  +-- otherwise ------------------------ CACHE
+  │
+  ├─ warmup? -------------------------- EXACT
+  ├─ external force refresh? ---------- EXACT
+  ├─ explicit force_refresh_steps? ---- EXACT
+  ├─ force_refresh_every interval? ---- EXACT
+  ├─ adaptive next refresh? ----------- EXACT
+  ├─ cached_run >= max_cached_run? ---- EXACT
+  ├─ guard/error budget fail? --------- EXACT
+  └─ otherwise ------------------------ CACHE
 ```
 
 Any exact step refreshes the probe anchor and tail residual.
@@ -240,12 +258,12 @@ Future work will evaluate selected-block cache, cache dtype compression, and pin
 
 ```text
 Load Diffusion Model
-        |
-        v
-MiniMax H3BC Native Cache Engine (alpha2)
-        |
-        +---> Basic Scheduler
-        +---> Basic Guider
+        │
+        ▼
+MiniMax H3BC Native Cache Engine (α4)
+        │
+        ├──► Basic Scheduler
+        └──► Basic Guider
 ```
 
 Do not stack H3BC with another H3 `double_block` cache/replacement node.
@@ -289,9 +307,9 @@ Evaluate not just speed but:
 ## Current limitations
 
 - H3BC is still an approximation when cache hits occur.
-- alpha2 production presets are starting points, not universal safety guarantees.
+- alpha4 production presets are first empirical calibration points, not universal safety guarantees.
 - Per-block selective cache is **not enabled yet**. First we profile real H3 block redundancy/cost.
-- Attention-vs-MLP sub-residual profiling is not implemented yet; alpha2 profiles full H3 block residuals first.
+- Attention-vs-MLP sub-residual profiling is not implemented yet; alpha4 profiles full H3 block residuals first.
 - Dynamic ComfyUI weight prefetch cannot be perfectly avoided for a cache hit without deeper core integration; `disable_dynamic_vbars` remains an A/B switch.
 - `decision_gate_ms` includes the synchronization needed to make the runtime cache decision, because that cost is real and must not be hidden.
 
